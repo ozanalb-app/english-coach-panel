@@ -1,6 +1,5 @@
-streamlit
+streamlit-webrtc>=0.48.1
+streamlit>=1.39.0
 openai
-streamlit-webrtc
 numpy
 soundfile
-av
