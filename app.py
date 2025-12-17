@@ -346,7 +346,7 @@ After STOP, it will auto-transcribe and ask the next question."""
                     )
 
                 if total_seconds < float(min_audio_seconds):
-                    st.warning("Audio too short. Please record a bit longer.")
+                    st.warning(f"Audio too short ({total_seconds:.2f}s). Please record a bit longer.") # Süreyi ekranda görmek için bunu değiştir
                     st.session_state.audio_chunks = []
                     st.session_state.processing_stop = False
                 else:
