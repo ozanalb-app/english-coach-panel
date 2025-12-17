@@ -19,7 +19,7 @@ if "lesson_active" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "audio_chunks" not in st.session_state:
-    # Now stores: list[tuple[np.ndarray, int]]  -> (mono_float32_samples, sr_used)
+    # list of (mono_float32_samples, sr_used)
     st.session_state.audio_chunks = []
 if "audio_sr" not in st.session_state:
     st.session_state.audio_sr = 48000
@@ -47,7 +47,7 @@ with st.expander("⚙️ Settings"):
     st.divider()
     show_audio_debug = st.toggle("🧪 Show audio debug", value=False)
     min_audio_seconds = st.slider("Min audio seconds (guard)", 0.1, 3.0, 0.6, 0.1)
-    stop_drain_ms = st.slider("STOP drain window (ms)", 0, 2000, 900, 50)
+    stop_drain_ms = st.slider("STOP drain window (ms)", 0, 2000, 1000, 50)
 
 st.divider()
 
@@ -103,10 +103,12 @@ def normalize_frame_to_mono_float32(frame) -> tuple[np.ndarray, dict]:
 
     if arr.ndim == 2:
         s0, s1 = arr.shape
-        if s0 in (1, 2) and s1 > 100:       # (channels, samples)
+        # (channels, samples)
+        if s0 in (1, 2) and s1 > 100:
             arr = arr.mean(axis=0)
             info["mono_axis"] = "axis0"
-        elif s1 in (1, 2) and s0 > 100:     # (samples, channels)
+        # (samples, channels)
+        elif s1 in (1, 2) and s0 > 100:
             arr = arr.mean(axis=1)
             info["mono_axis"] = "axis1"
         else:
@@ -134,7 +136,6 @@ def normalize_frame_to_mono_float32(frame) -> tuple[np.ndarray, dict]:
     return arr, info
 
 def get_frame_sr(frame) -> int:
-    # Prefer frame.sample_rate when present; otherwise keep last known SR
     try:
         sr = getattr(frame, "sample_rate", None)
         if sr:
@@ -152,7 +153,6 @@ def compute_total_seconds(chunks: list[tuple[np.ndarray, int]]) -> float:
     return float(total)
 
 def choose_write_sr(chunks: list[tuple[np.ndarray, int]]) -> int:
-    # Use the most common SR seen in frames; fallback 48000
     srs = [int(sr) for _, sr in chunks if sr]
     if not srs:
         return 48000
@@ -160,9 +160,7 @@ def choose_write_sr(chunks: list[tuple[np.ndarray, int]]) -> int:
 
 def build_wav_pcm16(chunks: list[tuple[np.ndarray, int]]) -> tuple[bytes, int]:
     """
-    Build a clean PCM_16 WAV.
-    Note: We DO NOT resample. We assume the captured SR is consistent enough.
-    We write using the most common SR observed.
+    Build a clean PCM_16 WAV. We do not resample; we write using most common SR.
     """
     write_sr = choose_write_sr(chunks)
     audio = np.concatenate([s for (s, _) in chunks]).astype(np.float32)
@@ -188,32 +186,40 @@ def transcribe_wav_bytes(wav_bytes: bytes) -> str:
     return getattr(tr, "text", str(tr))
 
 def drain_remaining_frames(ctx, max_ms: int) -> int:
+    """
+    After STOP, pull remaining buffered frames for a short window.
+    IMPORTANT: do NOT break on first empty read; frames may arrive late.
+    """
     if not ctx:
         return 0
+
     drained = 0
     t_end = time.time() + (max_ms / 1000.0)
+
     while time.time() < t_end:
         try:
             frames = ctx.audio_receiver.get_frames(timeout=0.05)
         except Exception:
             frames = []
-        if not frames:
-            break
 
-        for f in frames:
-            sr_used = get_frame_sr(f)
-            st.session_state.audio_sr = sr_used
+        if frames:
+            for f in frames:
+                sr_used = get_frame_sr(f)
+                st.session_state.audio_sr = sr_used
 
-            arr, info = normalize_frame_to_mono_float32(f)
-            st.session_state.audio_chunks.append((arr, sr_used))
+                arr, info = normalize_frame_to_mono_float32(f)
+                st.session_state.audio_chunks.append((arr, sr_used))
 
-            if show_audio_debug:
-                st.session_state.last_audio_debug = {
-                    "frame_info": info,
-                    "last_frame_sr": sr_used,
-                }
+                if show_audio_debug:
+                    st.session_state.last_audio_debug = {
+                        "frame_info": info,
+                        "last_frame_sr": sr_used,
+                    }
 
-            drained += 1
+                drained += 1
+        else:
+            time.sleep(0.03)
+
     return drained
 
 # =========================
@@ -262,14 +268,15 @@ if not st.session_state.lesson_active:
     st.info("Press START LESSON to begin.")
 else:
     st.caption(
-        "Press START to record, speak, then press STOP once. "
-        "After STOP, it will auto-transcribe and ask the next question."
+        """Press START to record, speak, then press STOP once.
+After STOP, it will auto-transcribe and ask the next question."""
     )
 
+    # IMPORTANT: bigger receiver buffer reduces "late frames" losses
     ctx = webrtc_streamer(
         key="stt-audio",
         mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=256,
+        audio_receiver_size=1024,
         media_stream_constraints={"video": False, "audio": True},
     )
 
@@ -312,29 +319,28 @@ else:
         if not client:
             st.error("API key missing.")
             st.session_state.processing_stop = False
+        else:
+            # Drain after STOP (critical)
+            drained = drain_remaining_frames(ctx, max_ms=int(stop_drain_ms))
+            if show_audio_debug:
+                st.caption(f"Drained frames after STOP: {drained}")
 
-        # Drain after STOP (important)
-        drained = drain_remaining_frames(ctx, max_ms=int(stop_drain_ms))
-
-        if show_audio_debug:
-            st.caption(f"Drained frames after STOP: {drained}")
-
-        if not st.session_state.audio_chunks:
-            st.warning("No audio captured. Please press START and speak before STOP.")
-            st.session_state.processing_stop = False
+            if not st.session_state.audio_chunks:
+                st.warning("No audio captured. Please press START and speak before STOP.")
+                st.session_state.processing_stop = False
 
         # Proceed if we have audio
         if st.session_state.processing_stop and st.session_state.audio_chunks:
             try:
                 total_seconds = compute_total_seconds(st.session_state.audio_chunks)
-                write_sr_peek = choose_write_sr(st.session_state.audio_chunks)
+                chosen_sr = choose_write_sr(st.session_state.audio_chunks)
 
                 if show_audio_debug:
                     st.session_state.last_audio_debug.update(
                         {
                             "chunks": len(st.session_state.audio_chunks),
-                            "total_seconds": total_seconds,
-                            "chosen_write_sr": write_sr_peek,
+                            "total_seconds": float(total_seconds),
+                            "chosen_write_sr": int(chosen_sr),
                             "min_required_seconds": float(min_audio_seconds),
                         }
                     )
