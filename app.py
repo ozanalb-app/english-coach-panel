@@ -262,4 +262,133 @@ if not st.session_state.lesson_active:
     st.info("Press START LESSON to begin.")
 else:
     st.caption(
-        "Press START to record, speak, then press STOP
+        "Press START to record, speak, then press STOP once. "
+        "After STOP, it will auto-transcribe and ask the next question."
+    )
+
+    ctx = webrtc_streamer(
+        key="stt-audio",
+        mode=WebRtcMode.SENDONLY,
+        audio_receiver_size=256,
+        media_stream_constraints={"video": False, "audio": True},
+    )
+
+    if st.button("CLEAR AUDIO BUFFER"):
+        st.session_state.audio_chunks = []
+        st.session_state.last_transcript = ""
+        st.session_state.processing_stop = False
+        st.session_state.last_audio_debug = {}
+        st.success("Cleared.")
+
+    is_playing = bool(ctx and ctx.state.playing)
+
+    # Collect frames while playing
+    if ctx and is_playing:
+        try:
+            frames = ctx.audio_receiver.get_frames(timeout=1)
+        except Exception:
+            frames = []
+
+        for f in frames:
+            sr_used = get_frame_sr(f)
+            st.session_state.audio_sr = sr_used
+
+            arr, info = normalize_frame_to_mono_float32(f)
+            st.session_state.audio_chunks.append((arr, sr_used))
+
+            if show_audio_debug:
+                st.session_state.last_audio_debug = {
+                    "frame_info": info,
+                    "last_frame_sr": sr_used,
+                }
+
+    # Detect STOP event
+    just_stopped = (st.session_state.prev_playing is True) and (is_playing is False)
+    st.session_state.prev_playing = is_playing
+
+    if just_stopped and not st.session_state.processing_stop:
+        st.session_state.processing_stop = True
+
+        if not client:
+            st.error("API key missing.")
+            st.session_state.processing_stop = False
+
+        # Drain after STOP (important)
+        drained = drain_remaining_frames(ctx, max_ms=int(stop_drain_ms))
+
+        if show_audio_debug:
+            st.caption(f"Drained frames after STOP: {drained}")
+
+        if not st.session_state.audio_chunks:
+            st.warning("No audio captured. Please press START and speak before STOP.")
+            st.session_state.processing_stop = False
+
+        # Proceed if we have audio
+        if st.session_state.processing_stop and st.session_state.audio_chunks:
+            try:
+                total_seconds = compute_total_seconds(st.session_state.audio_chunks)
+                write_sr_peek = choose_write_sr(st.session_state.audio_chunks)
+
+                if show_audio_debug:
+                    st.session_state.last_audio_debug.update(
+                        {
+                            "chunks": len(st.session_state.audio_chunks),
+                            "total_seconds": total_seconds,
+                            "chosen_write_sr": write_sr_peek,
+                            "min_required_seconds": float(min_audio_seconds),
+                        }
+                    )
+
+                if total_seconds < float(min_audio_seconds):
+                    st.warning("Audio too short. Please record a bit longer.")
+                    st.session_state.audio_chunks = []
+                    st.session_state.processing_stop = False
+                else:
+                    wav_bytes, write_sr = build_wav_pcm16(st.session_state.audio_chunks)
+                    transcript = transcribe_wav_bytes(wav_bytes)
+
+                    st.session_state.last_transcript = transcript
+                    st.success("Transcribed ✅")
+                    st.write("**You (transcript):**", transcript)
+
+                    out = assistant_call(
+                        f"My spoken answer (transcribed): {transcript}\n\n"
+                        f"Panel settings: speaking_target_minutes={speaking_minutes}, "
+                        f"min_sentences={min_sentences}, speed={speed}, report_length={report_length}.\n"
+                        "Continue the lesson according to the SYSTEM PROMPT rules. "
+                        "If my answer is short, ask follow-up questions until the target is met. "
+                        "IMPORTANT: Do NOT use praise fillers or coaching hype. "
+                        "Be neutral and continue automatically. Ask the next question."
+                    )
+
+                    st.write("**Assistant:**", out)
+                    if auto_speak:
+                        speak_in_browser(out)
+
+                    st.session_state.audio_chunks = []
+                    st.session_state.processing_stop = False
+
+            except Exception as e:
+                st.error(f"STT/Assistant error: {e}")
+                st.session_state.audio_chunks = []
+                st.session_state.processing_stop = False
+
+    if st.session_state.last_transcript:
+        st.caption("Last transcript:")
+        st.write(st.session_state.last_transcript)
+    if st.session_state.last_assistant:
+        st.caption("Last assistant message:")
+        st.write(st.session_state.last_assistant)
+
+    if show_audio_debug and st.session_state.last_audio_debug:
+        st.subheader("🧪 Audio debug")
+        st.json(st.session_state.last_audio_debug)
+
+st.divider()
+
+st.subheader("📜 Conversation (this lesson)")
+for m in st.session_state.messages:
+    if m["role"] == "assistant":
+        st.markdown(f"**Assistant:** {m['content']}")
+    elif m["role"] == "user":
+        st.markdown(f"**You:** {m['content']}")
