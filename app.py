@@ -3,7 +3,7 @@ from openai import OpenAI
 import json
 from datetime import datetime
 
-st.set_page_config(page_title="English Coaching Panel", layout="centered")
+st.set_page_config(page_title="Pinar`in Ingilizce Kocu", layout="centered")
 
 st.title("🎧 English Coaching Panel")
 
