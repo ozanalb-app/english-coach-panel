@@ -19,7 +19,6 @@ if "lesson_active" not in st.session_state:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "audio_chunks" not in st.session_state:
-    # list of (mono_float32_samples, sr_used)
     st.session_state.audio_chunks = []
 if "audio_sr" not in st.session_state:
     st.session_state.audio_sr = 48000
@@ -45,9 +44,9 @@ with st.expander("⚙️ Settings"):
     auto_speak = st.toggle("🔊 Auto speak assistant (browser voice)", value=True)
 
     st.divider()
-    show_audio_debug = st.toggle("🧪 Show audio debug", value=False)
-    min_audio_seconds = st.slider("Min audio seconds (guard)", 0.1, 3.0, 0.6, 0.1)
-    stop_drain_ms = st.slider("STOP drain window (ms)", 0, 2000, 1000, 50)
+    show_audio_debug = st.toggle("🧪 Show audio debug", value=True) # Varsayılan True yapıldı
+    min_audio_seconds = st.slider("Min audio seconds (guard)", 0.1, 3.0, 0.4, 0.1)
+    stop_drain_ms = st.slider("STOP drain window (ms)", 0, 3000, 1500, 50) # Drain window artırıldı
 
 st.divider()
 
@@ -80,321 +79,163 @@ def speak_in_browser(text: str, rate: float = 0.9):
     )
 
 def assistant_call(user_text: str) -> str:
-    st.session_state.messages.append({"role": "user", "content": user_text})
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=st.session_state.messages,
-    )
-    out = resp.choices[0].message.content
-    st.session_state.messages.append({"role": "assistant", "content": out})
-    st.session_state.last_assistant = out
-    return out
+    try:
+        st.session_state.messages.append({"role": "user", "content": user_text})
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=st.session_state.messages,
+        )
+        out = resp.choices[0].message.content
+        st.session_state.messages.append({"role": "assistant", "content": out})
+        st.session_state.last_assistant = out
+        return out
+    except Exception as e:
+        return f"AI Error: {str(e)}"
 
 def normalize_frame_to_mono_float32(frame) -> tuple[np.ndarray, dict]:
-    """
-    Robustly convert a WebRTC audio frame to mono float32 in [-1, 1].
-    Handles ndarray shapes (channels, samples) and (samples, channels).
-    """
     arr = frame.to_ndarray()
-    info = {
-        "orig_shape": tuple(arr.shape) if hasattr(arr, "shape") else None,
-        "orig_dtype": str(arr.dtype) if hasattr(arr, "dtype") else None,
-    }
-
+    info = {"orig_dtype": str(arr.dtype)}
     if arr.ndim == 2:
-        s0, s1 = arr.shape
-        # (channels, samples)
-        if s0 in (1, 2) and s1 > 100:
-            arr = arr.mean(axis=0)
-            info["mono_axis"] = "axis0"
-        # (samples, channels)
-        elif s1 in (1, 2) and s0 > 100:
-            arr = arr.mean(axis=1)
-            info["mono_axis"] = "axis1"
-        else:
-            arr = arr.reshape(-1)
-            info["mono_axis"] = "flatten"
-    elif arr.ndim > 2:
-        arr = arr.reshape(-1)
-        info["mono_axis"] = "flatten_ndim>2"
-    else:
-        info["mono_axis"] = "none"
-
+        arr = arr.mean(axis=1 if arr.shape[1] < arr.shape[0] else 0)
     if arr.dtype != np.float32:
         if np.issubdtype(arr.dtype, np.integer):
             arr = arr.astype(np.float32) / float(np.iinfo(arr.dtype).max)
-            info["scale"] = "int_to_float"
         else:
             arr = arr.astype(np.float32)
-            info["scale"] = "cast_float"
-    else:
-        info["scale"] = "already_float32"
-
-    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    arr = np.nan_to_num(arr, nan=0.0)
     arr = np.clip(arr, -1.0, 1.0)
-    info["final_len"] = int(arr.shape[0]) if hasattr(arr, "shape") else None
     return arr, info
 
 def get_frame_sr(frame) -> int:
-    try:
-        sr = getattr(frame, "sample_rate", None)
-        if sr:
-            return int(sr)
-    except Exception:
-        pass
-    return int(st.session_state.audio_sr or 48000)
+    return int(getattr(frame, "sample_rate", 48000))
 
 def compute_total_seconds(chunks: list[tuple[np.ndarray, int]]) -> float:
-    total = 0.0
-    for samples, sr in chunks:
-        sr = int(sr or 48000)
-        if sr > 0:
-            total += (len(samples) / sr)
-    return float(total)
+    return sum(len(samples) / sr for samples, sr in chunks if sr > 0)
 
 def choose_write_sr(chunks: list[tuple[np.ndarray, int]]) -> int:
-    srs = [int(sr) for _, sr in chunks if sr]
-    if not srs:
-        return 48000
-    return Counter(srs).most_common(1)[0][0]
+    srs = [sr for _, sr in chunks]
+    return Counter(srs).most_common(1)[0][0] if srs else 48000
 
 def build_wav_pcm16(chunks: list[tuple[np.ndarray, int]]) -> tuple[bytes, int]:
-    """
-    Build a clean PCM_16 WAV. We do not resample; we write using most common SR.
-    """
     write_sr = choose_write_sr(chunks)
     audio = np.concatenate([s for (s, _) in chunks]).astype(np.float32)
-
-    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
-    audio = np.clip(audio, -1.0, 1.0)
-    audio_i16 = (audio * 32767.0).astype(np.int16)
-
+    audio_i16 = (np.clip(audio, -1.0, 1.0) * 32767.0).astype(np.int16)
     wav_io = BytesIO()
-    sf.write(wav_io, audio_i16, samplerate=int(write_sr), format="WAV", subtype="PCM_16")
-    return wav_io.getvalue(), int(write_sr)
+    sf.write(wav_io, audio_i16, samplerate=write_sr, format="WAV", subtype="PCM_16")
+    return wav_io.getvalue(), write_sr
 
 def transcribe_wav_bytes(wav_bytes: bytes) -> str:
     bio = BytesIO(wav_bytes)
     bio.name = "speech.wav"
-    bio.seek(0)
+    # whisper-1 kullanımı zorunlu
     tr = client.audio.transcriptions.create(
-        model="gpt-4o-mini-transcribe",
+        model="whisper-1", 
         file=bio,
         language="en",
-        prompt="Transcribe in English. If unclear, choose closest English words.",
+        prompt="English transcription for a language learner.",
     )
-    return getattr(tr, "text", str(tr))
+    return tr.text
 
-def drain_remaining_frames(ctx, max_ms: int) -> int:
-    """
-    After STOP, pull remaining buffered frames for a short window.
-    IMPORTANT: do NOT break on first empty read; frames may arrive late.
-    """
-    if not ctx:
-        return 0
-
+def drain_remaining_frames(ctx, max_ms: int):
+    if not ctx or not ctx.audio_receiver: return 0
     drained = 0
     t_end = time.time() + (max_ms / 1000.0)
-
     while time.time() < t_end:
         try:
             frames = ctx.audio_receiver.get_frames(timeout=0.05)
-        except Exception:
-            frames = []
-
-        if frames:
-            for f in frames:
-                sr_used = get_frame_sr(f)
-                st.session_state.audio_sr = sr_used
-
-                arr, info = normalize_frame_to_mono_float32(f)
-                st.session_state.audio_chunks.append((arr, sr_used))
-
-                if show_audio_debug:
-                    st.session_state.last_audio_debug = {
-                        "frame_info": info,
-                        "last_frame_sr": sr_used,
-                    }
-
-                drained += 1
-        else:
-            time.sleep(0.03)
-
+            if frames:
+                for f in frames:
+                    sr = get_frame_sr(f)
+                    arr, _ = normalize_frame_to_mono_float32(f)
+                    st.session_state.audio_chunks.append((arr, sr))
+                    drained += 1
+            else:
+                time.sleep(0.05)
+        except: break
     return drained
 
 # =========================
 # Lesson controls
 # =========================
 st.subheader("▶️ Lesson")
-
 colA, colB = st.columns(2)
-start_disabled = (not api_key) or (not system_prompt) or st.session_state.lesson_active
-end_disabled = not st.session_state.lesson_active
 
-if colA.button("START LESSON", disabled=start_disabled):
+if colA.button("START LESSON", disabled=st.session_state.lesson_active or not api_key):
     st.session_state.lesson_active = True
     st.session_state.messages = [{"role": "system", "content": system_prompt}]
     st.session_state.audio_chunks = []
-    st.session_state.prev_playing = False
-    st.session_state.processing_stop = False
-    st.session_state.last_transcript = ""
-    st.session_state.last_assistant = ""
-    st.session_state.last_audio_debug = {}
+    first = assistant_call("START LESSON pressed. Begin Level Assessment A2-B2. No praise. Max 2 sentences.")
+    st.rerun()
 
-    first = assistant_call(
-        "START LESSON was pressed. Begin the lesson now. "
-        "VOICE style: 1–2 short sentences, then ask ONE simple question. "
-        "IMPORTANT: Do NOT use praise fillers or coaching hype. "
-        "Do NOT say: Great / Great job / Thank you for sharing / Well done. "
-        "Be neutral and continue automatically."
-    )
-    st.success("Lesson ACTIVE ✅")
-    st.write("**Assistant:**", first)
-    if auto_speak:
-        speak_in_browser(first)
-
-if colB.button("END LESSON", disabled=end_disabled):
+if colB.button("END LESSON", disabled=not st.session_state.lesson_active):
     st.session_state.lesson_active = False
-    st.success("Lesson ended ✅")
+    st.rerun()
 
 st.divider()
 
 # =========================
-# Speak (STT) — ONE STOP ONLY
+# Speak (STT)
 # =========================
-st.subheader("🎙️ Speak (STT)")
-
-if not st.session_state.lesson_active:
-    st.info("Press START LESSON to begin.")
-else:
-    st.caption(
-        """Press START to record, speak, then press STOP once.
-After STOP, it will auto-transcribe and ask the next question."""
-    )
-
-    # IMPORTANT: bigger receiver buffer reduces "late frames" losses
+if st.session_state.lesson_active:
+    st.subheader("🎙️ Speak (STT)")
+    
     ctx = webrtc_streamer(
         key="stt-audio",
         mode=WebRtcMode.SENDONLY,
-        audio_receiver_size=1024,
+        audio_receiver_size=4096, # Arabelleği büyüttük
         media_stream_constraints={"video": False, "audio": True},
     )
 
-    if st.button("CLEAR AUDIO BUFFER"):
-        st.session_state.audio_chunks = []
-        st.session_state.last_transcript = ""
-        st.session_state.processing_stop = False
-        st.session_state.last_audio_debug = {}
-        st.success("Cleared.")
-
     is_playing = bool(ctx and ctx.state.playing)
 
-    # Collect frames while playing
-    if ctx and is_playing:
+    # Ses verisini anlık yakala
+    if ctx and is_playing and ctx.audio_receiver:
         try:
-            frames = ctx.audio_receiver.get_frames(timeout=1)
-        except Exception:
-            frames = []
+            frames = ctx.audio_receiver.get_frames(timeout=0.1)
+            for f in frames:
+                sr = get_frame_sr(f)
+                arr, info = normalize_frame_to_mono_float32(f)
+                st.session_state.audio_chunks.append((arr, sr))
+        except:
+            pass
 
-        for f in frames:
-            sr_used = get_frame_sr(f)
-            st.session_state.audio_sr = sr_used
-
-            arr, info = normalize_frame_to_mono_float32(f)
-            st.session_state.audio_chunks.append((arr, sr_used))
-
-            if show_audio_debug:
-                st.session_state.last_audio_debug = {
-                    "frame_info": info,
-                    "last_frame_sr": sr_used,
-                }
-
-    # Detect STOP event
-    just_stopped = (st.session_state.prev_playing is True) and (is_playing is False)
+    # STOP Algılama
+    just_stopped = (st.session_state.prev_playing and not is_playing)
     st.session_state.prev_playing = is_playing
 
     if just_stopped and not st.session_state.processing_stop:
         st.session_state.processing_stop = True
-
-        if not client:
-            st.error("API key missing.")
+        drain_remaining_frames(ctx, stop_drain_ms)
+        
+        total_sec = compute_total_seconds(st.session_state.audio_chunks)
+        
+        if total_sec < min_audio_seconds:
+            st.warning(f"Audio too short ({total_sec:.2f}s). Talk more and wait 1s before stopping.")
+            st.session_state.audio_chunks = []
             st.session_state.processing_stop = False
         else:
-            # Drain after STOP (critical)
-            drained = drain_remaining_frames(ctx, max_ms=int(stop_drain_ms))
-            if show_audio_debug:
-                st.caption(f"Drained frames after STOP: {drained}")
-
-            if not st.session_state.audio_chunks:
-                st.warning("No audio captured. Please press START and speak before STOP.")
-                st.session_state.processing_stop = False
-
-        # Proceed if we have audio
-        if st.session_state.processing_stop and st.session_state.audio_chunks:
-            try:
-                total_seconds = compute_total_seconds(st.session_state.audio_chunks)
-                chosen_sr = choose_write_sr(st.session_state.audio_chunks)
-
-                if show_audio_debug:
-                    st.session_state.last_audio_debug.update(
-                        {
-                            "chunks": len(st.session_state.audio_chunks),
-                            "total_seconds": float(total_seconds),
-                            "chosen_write_sr": int(chosen_sr),
-                            "min_required_seconds": float(min_audio_seconds),
-                        }
-                    )
-
-                if total_seconds < float(min_audio_seconds):
-                    st.warning(f"Audio too short ({total_seconds:.2f}s). Please record a bit longer.") # Süreyi ekranda görmek için bunu değiştir
-                    st.session_state.audio_chunks = []
-                    st.session_state.processing_stop = False
-                else:
-                    wav_bytes, write_sr = build_wav_pcm16(st.session_state.audio_chunks)
-                    transcript = transcribe_wav_bytes(wav_bytes)
-
-                    st.session_state.last_transcript = transcript
-                    st.success("Transcribed ✅")
-                    st.write("**You (transcript):**", transcript)
-
-                    out = assistant_call(
-                        f"My spoken answer (transcribed): {transcript}\n\n"
-                        f"Panel settings: speaking_target_minutes={speaking_minutes}, "
-                        f"min_sentences={min_sentences}, speed={speed}, report_length={report_length}.\n"
-                        "Continue the lesson according to the SYSTEM PROMPT rules. "
-                        "If my answer is short, ask follow-up questions until the target is met. "
-                        "IMPORTANT: Do NOT use praise fillers or coaching hype. "
-                        "Be neutral and continue automatically. Ask the next question."
-                    )
-
-                    st.write("**Assistant:**", out)
+            with st.spinner("Processing speech..."):
+                try:
+                    wav_b, _ = build_wav_pcm16(st.session_state.audio_chunks)
+                    txt = transcribe_wav_bytes(wav_b)
+                    st.session_state.last_transcript = txt
+                    
+                    ai_resp = assistant_call(f"User says: {txt}. Settings: Target {speaking_minutes}m. Continue lesson.")
                     if auto_speak:
-                        speak_in_browser(out)
-
-                    st.session_state.audio_chunks = []
-                    st.session_state.processing_stop = False
-
-            except Exception as e:
-                st.error(f"STT/Assistant error: {e}")
+                        speak_in_browser(ai_resp)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                
                 st.session_state.audio_chunks = []
                 st.session_state.processing_stop = False
+                st.rerun()
 
     if st.session_state.last_transcript:
-        st.caption("Last transcript:")
-        st.write(st.session_state.last_transcript)
+        st.info(f"You: {st.session_state.last_transcript}")
     if st.session_state.last_assistant:
-        st.caption("Last assistant message:")
-        st.write(st.session_state.last_assistant)
-
-    if show_audio_debug and st.session_state.last_audio_debug:
-        st.subheader("🧪 Audio debug")
-        st.json(st.session_state.last_audio_debug)
+        st.write(f"**Assistant:** {st.session_state.last_assistant}")
 
 st.divider()
-
-st.subheader("📜 Conversation (this lesson)")
-for m in st.session_state.messages:
-    if m["role"] == "assistant":
-        st.markdown(f"**Assistant:** {m['content']}")
-    elif m["role"] == "user":
-        st.markdown(f"**You:** {m['content']}")
+st.subheader("📜 History")
+for m in st.session_state.messages[1:]:
+    st.text(f"{m['role'].capitalize()}: {m['content']}")
